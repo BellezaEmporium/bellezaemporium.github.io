@@ -4,7 +4,7 @@
 The work done here is for educational purposes. In no way should you infringe/circumvent EA's current protections. The work shown is part of future interoperability measures (for GOG Galaxy's EA plugin, or for future implementations).
 In the country this operation was done, the European Union allows/tolerates reverse engineering in the sole intention of interoperability. [See this writeup for more information.](https://vidstromlabs.com/blog/the-legal-boundaries-of-reverse-engineering-in-the-eu/)
 
-## Kudos
+# Kudos
 Kudos to [erri120](https://github.com/erri120) for the first writeup, now deleted from his GitHub page (still available in the Internet Archive).
 
 # Why ?
@@ -126,7 +126,7 @@ and you would get a key.
 
 __AND THE IV ???__ you would most certainly ask me. Well... just write the file name. Yes, just the file name. __allUsersGen-__ no-no, just CONF-production. Test it, you'll see.
 
-You don't know how the machine hash is made and you don't want to check again ? Check the EA Background Service logs, it blatantly show it to you. I'm not joking. Someday, i'll see if it's any different from the previous version... That would be the subject of an update in this marvelous write-up, isn't it ?
+You don't know how the machine hash is made and you don't want to check again ? Check the EA Background Service logs, it blatantly show it to you. Or recreate the string once again. It didn't change over time.
 
 Anyhow, that closed the loop on the discrepancies linked to this f- 
 
@@ -160,20 +160,30 @@ And one of the pieces of information that it could give you is the Nucleus ID (w
 
 Yes, it now uses the Nucleus ID as an alternative choice. Either you need to use a Nucleus ID (for all files in that folder), either it uses a hardcoded string. It will all depend on the flag.
 
-About how to get the machine hash, it doesn't change from the previous writeup. It should still work.
+So, if we recapitulate, we have :
+
+```text
+SHA3-256("allUsersGenericId" + file name + "l)%ge7fomILhfj*Qfi+,")
+```
+
+```text
+SHA3-256("allUsersGenericId" + file name + machine hash)
+```
+which is the specific CONF-production workaround, AND
+
+```text
+SHA3-256(Nucleus ID + file + machine hash)
+```
+for the files from that other folder (and its very specific CONF-production... yes, it can be very confusing.)
 
 ## Why the static and dynamic analysis both mattered
 
-Static analysis alone got me the structure: the factory, the algorithm IDs, the object layout, and the helper function flow. Runtime tracing was what turned those decompiled guesses into facts by exposing the exact input strings and the exact digest bytes used during execution.
+Starting from the static analysis (via IDA) gave me a few pieces of very important information, to know where I should start digging further. The "Class Informer" tool gave me RTTI information about classes IDA wouldn't have named, and it simplified the searching task. From there, I could pinpoint which function called what, in which occasion it would have been called, and deduct which information was it filling out.
 
-That combination was the key to making fast progress. Instead of trying to fully reconstruct the entire codebase, I only needed to identify the right helper functions and then verify the behavior live with Frida.
+The dynamic analysis (via Frida) gave me what the static analysis wouldn't have done : data on the go. The other piece of mystery, unfolding into my hands. By pinpointing what to trace and sniff, it improved our efficiency in finding out what we needed.
 
 ## Final notes
 
-In the end, the protection was much less mysterious than it first appeared. The binary wrapped standard primitives behind internal abstractions, but once the SHA3 helper and the AES path were instrumented, the whole mechanism reduced to a predictable sequence of concatenation, hashing, and decryption.
+In the end, it was much less mysterious than it first appeared. Thanks to Erri's first writeup, we had an idea of what we needed to look for. This writeup confirms that some things haven't changed, and that some sneaky additions were made to cut off the previous decryption techniques. Once the SHA3 helper and the AES path were instrumented, the whole mechanism reduced to a predictable sequence of cat and mice.
 
-The useful lesson here was not just “EA used SHA3 and AES,” but that even a wrapper-heavy C++ binary becomes manageable once you stop chasing names and start logging concrete inputs, outputs, and call order.
-
-## Closing
-
-What started as “some encrypted EA file” ended with a fully traceable chain of hash inputs, digest generation, and AES-256-CBC usage. Once the right helper functions were isolated, the rest was just careful tracing and validation.
+The useful lesson here was not just “EA hasn't changed anything”, they've did, but that they loved giving us a hard time by recoding some library functions to blur out obvious clues.
