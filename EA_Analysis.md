@@ -19,20 +19,20 @@ What looked opaque at first turned out to be a fairly ordinary chain of hashing 
 
 The initial target was a set of EA App local data files that were clearly not plaintext. Rather than guessing blindly, I began by identifying the process that touched the files and then pivoted into the binary that handled the relevant reads and writes.
 
-The binary exposed a number of useful class and symbol names, including `eax::foundation::Sha3Hasher` and `eax::foundation::DirtyPiecewiseHasher`, which immediately suggested there was a reusable hashing subsystem under the hood. 
-That was the first hint that the protection logic was probably not custom cryptography, just standard algorithms hidden behind internal wrappers.
+The binary exposed a number of useful class and symbol names, including `eax::foundation::Sha3Hasher` and `eax::foundation::DirtyPiecewiseHasher`, which immediately suggested they've ditched the library imports for an in-house solution, rather than exposing OpenSSL libraries directly.
+That was the first hint that the protection logic was probably linked to a reimplementation of basic cryptography functions.
 
 ## First foothold in the binary
 
-The first important decompiled function is the Sha3Hasher.
+First, let's dive into the Sha3Hasher set of functions.
 
-For algorithm IDs `6`, `7`, and `8`, it constructs an `eax::foundation::Sha3Hasher` object and sets digest sizes of 16, 32, and 64 bytes respectively, making `alg=7` the SHA3-256 path.
+For algorithm IDs `6`, `7`, and `8`, it constructs an `eax::foundation::Sha3Hasher` object and sets digest sizes of 16, 32, and 64 bytes respectively, making `alg=7` the SHA3-256 path. I'm specifically precising this here, because if you point back to the first writeup, it was already the main hashing function being used.
 
 That mapping mattered because it gave me a reliable runtime filter. Once I knew `alg=7` meant SHA3-256, I could stop chasing every hash-related call and focus only on the specific object family I cared about.
 
 ## The key helper function
 
-The real breakthrough came from another function below it. In decompiled form, it creates an `alg=7` hasher, feeds it two inputs through one virtual method, finalizes once through another virtual method, then hashes a third component and finalizes again.
+The real breakthrough came from another function below it. That function created an `alg=7` hasher, fed two inputs through one virtual method, finalizes once through another virtual method, then hashes a third component and finalizes again.
 
 In simplified form, the routine behaves like this:
 
@@ -76,7 +76,7 @@ One of the most useful traces looked like this:
 That proved two important things:
 
 1. The first digest is built from `allUsersGenericId` and `IS`.
-2. The second digest adds a third value, which in this branch is the hardcoded string `l)%ge7fomILhfj*Qfi+,`. This was different from the previous writeup, that included a hardware hash in every single file request.
+2. The second digest adds a third value, which in this branch is this hardcoded string `l)%ge7fomILhfj*Qfi+,`. This was different from the previous writeup, that included a hardware hash in every single file request.
 
 In the `flag=1` branch, the third chunk was not the hardcoded fallback string but the return value of `0x1405186C0`, which my Frida hook showed as a 40-character ASCII hex string. Importantly, the hasher received that value as literal text, not decoded binary.
 
@@ -90,7 +90,7 @@ For example, in the `flag=0` branch, the final digest is:
 SHA3-256("allUsersGenericId" + "IS" + "l)%ge7fomILhfj*Qfi+,")
 ```
 
-This was an important correction to my earlier thinking. EA didn't use a hardware hash in every file decipher, but used a hardcoded string, in an homemade SHA3 hasher function.
+This was an important correction to my earlier thinking. EA didn't use a hardware hash in every file decipher, but used a hardcoded string in a specific flag, for specific files, in a homemade SHA3 hasher function.
 
 ## Following the data into AES
 
@@ -99,6 +99,8 @@ Once I had the recovered 32-byte SHA3 output, the next question was whether that
 A 32-byte value is compatible with AES-256, but compatibility alone proves nothing. I had to confirm they were still using AES-256, AES-256-CBC specifically.
 
 The key we've found could either be an IV, or a key. If we remember Erri's previous findings, they've found the IV was a constant (yes, nothing changes, only the key used to), and the key was the IV + something else, which was pieces of hardware information (taken from WMI), hashed into SHA1.
+
+## Has it moved since ?
 
 Well, let me tell you it has changed. Not much, but enough that from the first writeup to today, it could break a few things. For certain files (IQ, IS, CATS2), it is **STILL** a constant, being :
 
@@ -114,7 +116,7 @@ It's available in there, and in another folder, which is another big string that
 
 Indeed, that other folder contains only 2 files: CONF-production (yet again ???) and NS. This will be extra important for the next steps, you'll find out why.
 
-The CONF-production file in the `530c11479fe252fc5aabc24935b9776d4900eb3ba58fdc271e0d6229413ad40e` folder... does not need any prefix (yes, you've heard me right), but the key will need you to get your wonderful machine hash ! (yes, your SHA-1 hardware information.)
+The CONF-production file in the `530c11479fe252fc5aabc24935b9776d4900eb3ba58fdc271e0d6229413ad40e` folder... does not need any prefix (yes, you've heard me right). Which means, just write the file name. Yes, just the file name. __allUsersGen-__ no-no, just CONF-production. Test it, you'll see., but the key will need you to get your wonderful machine hash ! (yes, your SHA-1 hardware information.)
 
 Try to do this : 
 
@@ -124,11 +126,36 @@ SHA3-256("CONF-production" + machinehash)
 
 and you would get a key.
 
-__AND THE IV ???__ you would most certainly ask me. Well... just write the file name. Yes, just the file name. __allUsersGen-__ no-no, just CONF-production. Test it, you'll see.
+## The machine hash extravaganza
 
-You don't know how the machine hash is made and you don't want to check again ? Check the EA Background Service logs, it blatantly show it to you. Or recreate the string once again. It didn't change over time.
+You don't know how the machine hash is made and you don't want to check again ? Check the EA Background Service logs, it blatantly shows it to you. Or recreate the string once again. It didn't change over time.
+
+For the recall, here's how we make the machine hash : 
+
+```
+Win32_BaseBoard Manufacturer
+Win32_BaseBoard SerialNumber
+Win32_BIOS Manufacturer
+Win32_BIOS SerialNumber
+Win32_VideoController PNPDeviceId
+Win32_Processor Manufacturer
+Win32_Processor ProcessorId
+Win32_Processor Name
+```
+
+Some of the logs also seem to point that there's a few other things being checked on the spot (eg. why does it show my antivirus ?). There's a few other things being catched here, which are as followed : 
+
+```
+Win32_OperatingSystem SerialNumber
+Win32_OperatingSystem InstallDate
+AntivirusProduct Name
+```
+
+The operating system data is important for the pcSign creation, which will generate a one-time token in order for the EA services to identify which computer connects (also if it's a new computer).
 
 Anyhow, that closed the loop on the discrepancies linked to this f- 
+
+## The other mystery
 
 __WAIT ! You've talked about the other folder, that EXTRA IMPORTANT folder !__
 
@@ -136,7 +163,7 @@ Ah yes, that folder. Well, you see, I was wondering how I could have a secondary
 
 ```
 [sub_14051AAD0]
-  in1 = a number
+  in1 = <a number>
   in2 = CONF-production
   flag = 1
 [SHA3 upd #1]
@@ -155,7 +182,7 @@ Ah yes, that folder. Well, you see, I was wondering how I could have a secondary
 [SHA3 final #2]
 ```
 
-That number... it looked very familiar. When I had worked on my GOG Galaxy plugin, I had to use EA's very own API. And one of the APIs was user-related (if you remember, it was [this URL](https://gateway.ea.com/proxy/identity/pids/me)). 
+That number... it looked very familiar. You see, when I had worked on my GOG Galaxy plugin, I had to use EA's very own API, from the Origin era. And one of the APIs was user-related (if you remember, it was [this URL](https://gateway.ea.com/proxy/identity/pids/me)). 
 And one of the pieces of information that it could give you is the Nucleus ID (which was the old Origin way of calling your account ID). You now understood what I'm saying here... that other piece of very important information is your Nucleus ID ! (little trick : hash your Nucleus ID in SHA3-256, you'll see the magic happen).
 
 Yes, it now uses the Nucleus ID as an alternative choice. Either you need to use a Nucleus ID (for all files in that folder), either it uses a hardcoded string. It will all depend on the flag.
@@ -165,16 +192,20 @@ So, if we recapitulate, we have :
 ```text
 SHA3-256("allUsersGenericId" + file name + "l)%ge7fomILhfj*Qfi+,")
 ```
-
+,
 ```text
 SHA3-256("allUsersGenericId" + file name + machine hash)
 ```
-which is the specific CONF-production workaround, AND
-
+,
+AND, for the specific CONF-production workaround,
 ```text
 SHA3-256(Nucleus ID + file + machine hash)
 ```
-for the files from that other folder (and its very specific CONF-production... yes, it can be very confusing.)
+in that nucleus ID folder, or 
+```text
+SHA3-256(file name + machine hash)
+```
+in that allUsers folder (yes, it can be very confusing).
 
 ## Why the static and dynamic analysis both mattered
 
