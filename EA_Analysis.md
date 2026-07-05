@@ -9,7 +9,7 @@ Kudos to [erri120](https://github.com/erri120) for the first writeup, now delete
 
 # Why ?
 
-Based on the first writeup, I had implemented a piece of the GOG Galaxy plugin that was able to decipher the IS file, which basically was installation information. Nothing too scary or fancy in there, I've wondered why it was enciphered. Over the updates, the function became useless, and I was trying to find out why.
+Based on the first writeup, I had implemented a piece of the GOG Galaxy plugin that was able to decipher the IS file, which basically was installation information. Nothing too scary or fancy in there, I've wondered why it was enciphered. Over the updates, the function became useless, as EA changed their functions & operations, and I was trying to find out why.
 
 From this situation, a simple goal emerged: recover information from EA App’s locally stored data files and understand how the application derives the crypto material used to protect them.
 
