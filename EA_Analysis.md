@@ -1,220 +1,239 @@
-# Reversing EA App’s Local Encryption
+# Reversing EA App's Local Encryption
 
-# DISCLAIMER / LEGAL
-The work done here is for educational purposes. In no way should you infringe/circumvent EA's current protections. The work shown is part of future interoperability measures (for GOG Galaxy's EA plugin, or for future implementations).
-In the country this operation was done, the European Union allows/tolerates reverse engineering in the sole intention of interoperability. [See this writeup for more information.](https://vidstromlabs.com/blog/the-legal-boundaries-of-reverse-engineering-in-the-eu/)
+## DISCLAIMER / LEGAL
 
-# Kudos
-Kudos to [erri120](https://github.com/erri120) for the first writeup, now deleted from his GitHub page (still available in the Internet Archive).
+This work is for educational purposes and future interoperability (GOG Galaxy EA plugin). Reverse engineering for interoperability is tolerated under EU law. [See this writeup for more information.](https://vidstromlabs.com/blog/the-legal-boundaries-of-reverse-engineering-in-the-eu/)
 
-# Why ?
+*Kudos to [erri120](https://github.com/erri120) for the original writeup (2023), now archived on the Internet Archive. This writeup builds on his findings and documents what has changed since.*
 
-Based on the first writeup, I had implemented a piece of the GOG Galaxy plugin that was able to decipher the IS file, which basically was installation information. Nothing too scary or fancy in there, I've wondered why it was enciphered. Over the updates, the function became useless, as EA changed their functions & operations, and I was trying to find out why.
+---
 
-From this situation, a simple goal emerged: recover information from EA App’s locally stored data files and understand how the application derives the crypto material used to protect them.
+## Why?
 
-What looked opaque at first turned out to be a fairly ordinary chain of hashing and AES, wrapped in custom C++ classes and helper functions. By combining static analysis with runtime tracing, I was able to map the full flow from string constants in the binary to the final decryption path.
+Based on erri120's first writeup, I had implemented a piece of the GOG Galaxy plugin that was able to decipher the IS file — installation state data. Over EA App updates, that implementation broke. I wanted to understand why.
+
+The goal was simple: recover information from EA App's locally stored data files and understand how the application derives the crypto material used to protect them. What looked opaque at first turned out to be a fairly ordinary chain of SHA3-256 hashing and AES-256-CBC, wrapped in custom C++ classes. By combining static analysis (IDA) with runtime tracing (Frida 17.2), I mapped the full flow from string constants in the binary into the final decryption path — and documented exactly where EA diverged from the original implementation.
+
+---
 
 ## Background
 
-The initial target was a set of EA App local data files that were clearly not plaintext. Rather than guessing blindly, I began by identifying the process that touched the files and then pivoted into the binary that handled the relevant reads and writes.
+The target was a set of EA App local data files under `C:\ProgramData\EA Desktop\` — clearly not plaintext. Rather than guessing blindly, I identified the process that touched the files (`EABackgroundService.exe`) and pivoted into the binary handling the relevant reads and writes.
 
-The binary exposed a number of useful class and symbol names, including `eax::foundation::Sha3Hasher` and `eax::foundation::DirtyPiecewiseHasher`, which immediately suggested they've ditched the library imports for an in-house solution, rather than exposing OpenSSL libraries directly.
-That was the first hint that the protection logic was probably linked to a reimplementation of basic cryptography functions.
+The binary exposed useful class and symbol names via RTTI, recovered with IDA's **Class Informer** plugin. Notable entries included `eax::foundation::Sha3Hasher` and `eax::foundation::DirtyPiecewiseHasher`. This immediately suggested EA ditched direct OpenSSL imports in favor of an in-house crypto wrapper — the first hint that the protection logic was a reimplementation of standard primitives rather than a thin shim over a well-known library.
 
-## First foothold in the binary
+> **Important for anyone trying to reproduce this:** EA's SHA3 implementation is **statically linked** into `EABackgroundService.exe`. Do not waste time trying `Module.getExportByName("libcrypto-1_1-x64.dll", ...)` for the hashing side — it will find nothing. The correct approach is to resolve the hasher constructor via `base_address + RVA` at runtime, then walk the vtable to hook the virtual `update` and `final` methods. `libcrypto-1_1-x64.dll` is only relevant for the AES layer (see below).
 
-First, let's dive into the Sha3Hasher set of functions.
+---
 
-For algorithm IDs `6`, `7`, and `8`, it constructs an `eax::foundation::Sha3Hasher` object and sets digest sizes of 16, 32, and 64 bytes respectively, making `alg=7` the SHA3-256 path. I'm specifically precising this here, because if you point back to the first writeup, it was already the main hashing function being used.
+## Filesystem Layout
 
-That mapping mattered because it gave me a reliable runtime filter. Once I knew `alg=7` meant SHA3-256, I could stop chasing every hash-related call and focus only on the specific object family I cared about.
-
-## The key helper function
-
-The real breakthrough came from another function below it. That function created an `alg=7` hasher, fed two inputs through one virtual method, finalizes once through another virtual method, then hashes a third component and finalizes again.
-
-In simplified form, the routine behaves like this:
-
-- `intermediate = SHA3-256(in1 || in2)`
-- `final = SHA3-256(in1 || in2 || extra)`
-
-This was the moment where the static analysis became actionable. I now had a concrete function that was clearly building structured SHA3-256 digests from named string inputs instead of some generic crypto noise.
-
-## Confirming the hash logic with Frida
-
-To validate the static analysis, I hooked both the SHA3 hasher factory and the initializer in Frida. The runtime traces confirmed that `alg=7` objects corresponded to the 32-byte initialization path, and that the internal context began at `obj + 8`, matching the object layout implied by the constructor.
-
-At first, I mistakenly treated the outputs as UTF-8 strings, which caused decode failures. That turned out to be expected: SHA3-256 returns a raw 32-byte binary digest, so the correct way to inspect the result was to dump the output buffer as hexadecimal instead of trying to render it as text.
-
-Once I hooked the SHA3 virtual `update` and `final` methods, I could see the exact input chunks being fed to the hasher in order.
-
-## What the runtime trace showed
-
-One of the most useful traces looked like this:
+Two folders exist under `C:\ProgramData\EA Desktop\`, both named after SHA3-256 hashes:
 
 ```text
-[sub_14051AAD0]
-  in1 = allUsersGenericId
-  in2 = IS
+C:\ProgramData\EA Desktop\
+├── 530c11479fe252fc5aabc24935b9776d4900eb3ba58fdc271e0d6229413ad40e\
+│   │   = SHA3-256("allUsersGenericId")         ← allUsers folder
+│   ├── IS
+│   ├── IQ
+│   ├── CATS2
+│   └── CONF-production
+│
+└── <SHA3-256(nucleus_id)>\                      ← Nucleus folder
+    ├── NS
+    └── CONF-production
+```
+
+The allUsers folder is machine-scoped. The Nucleus folder is user-scoped, named after your Nucleus ID (the account identifier used since the Origin era, recoverable from `https://gateway.ea.com/proxy/identity/pids/me`). You can verify this by computing `SHA3-256(your_nucleus_id)` — you will recognize the result as a folder name on disk.
+
+---
+
+## The Files
+
+| File | Full name | Folder |
+|------|-----------|--------|
+| IS | Installation State | allUsers |
+| IQ | Installation Queue | allUsers |
+| CATS2 | Catalog Items | allUsers |
+| CONF-production | Global Config (cached from EA servers) | allUsers + Nucleus |
+| NS | Nucleus Entitlements State | Nucleus |
+
+CONF-production is a locally cached copy of EA's [`globalConfig.json`](https://desktop-config.juno.ea.com/globalConfig.json). Its presence in both folders — with different key formulas — is what makes it structurally unusual compared to the other files.
+
+---
+
+## First Foothold: The SHA3 Hasher
+
+The `eax::foundation::Sha3Hasher` constructor takes an algorithm ID mapping to digest
+sizes:
+
+| `alg` value | Variant  | Digest size |
+|-------------|----------|-------------|
+| `6`         | SHA3-128 | 16 bytes    |
+| `7`         | SHA3-256 | 32 bytes    |
+| `8`         | SHA3-512 | 64 bytes    |
+
+`alg=7` is the SHA3-256 path — consistent with erri120's original findings. Knowing this mapping meant I could stop chasing every hash-related call and focus only on objects constructed with `alg=7`.
+
+---
+
+## The Key Derivation Helper
+
+The real breakthrough came from a helper function responsible for building all file decryption keys. It creates an `alg=7` hasher, feeds two inputs through the virtual `update` method, finalizes once, then hashes a third component and finalizes again:
+
+```text
+IV  = SHA3-256(in1 || in2)
+Key = SHA3-256(in1 || in2 || extra)
+```
+
+Both the IV and the Key come out of the **same function** — the intermediate finalization produces the IV, the second finalization produces the Key. This is why the helper performs two finalizations rather than one.
+
+A `flag` parameter controls what `extra` is:
+
+- `flag=0` → `extra` is a **hardcoded ASCII string** embedded in the binary
+- `flag=1` → `extra` is the **machine hash** (a 40-character ASCII hex string, passed as literal text, not decoded binary)
+
+---
+
+## Confirming with Frida 17.2
+
+To validate the static analysis, I hooked the SHA3 hasher constructor and the virtual `update`/`final` methods in Frida. Key notes:
+
+- SHA3-256 returns **raw binary** — always hexdump the output buffer, never attempt UTF-8 decoding directly
+- Hook virtual methods via vtable offsets, not export names
+- Internal context starts at `obj + 8`, matching the constructor's object layout
+
+One of the most informative traces:
+
+```text
+[key_derivation_helper]
+  in1  = allUsersGenericId
+  in2  = IS
   flag = 0
 
-[SHA3 upd #1]
-  str : allUsersGenericId
-
-[SHA3 upd #2]
-  str : IS
-
-[SHA3 final #1]
-
-[SHA3 upd #3]
-  str : l)%ge7fomILhfj*Qfi+,
-
-[SHA3 final #2]
+[SHA3 upd #1]  str : allUsersGenericId
+[SHA3 upd #2]  str : IS
+[SHA3 final #1]                          ← this output is the IV
+[SHA3 upd #3]  str : <hardcoded string>
+[SHA3 final #2]                          ← this output is the Key
 ```
 
-That proved two important things:
+### Frida 17.2 Breaking Changes
 
-1. The first digest is built from `allUsersGenericId` and `IS`.
-2. The second digest adds a third value, which in this branch is this hardcoded string `l)%ge7fomILhfj*Qfi+,`. This was different from the previous writeup, that included a hardware hash in every single file request.
+| Old API | Replacement |
+|---------|-------------|
+| `Module.findExportByName(mod, fn)` | `Module.getExportByName(fn)` |
+| `Memory.scan(...)` with `\|` pipe patterns | Hex byte patterns only (`"48 89 ?? 24"`) |
+| `Process.getCurrentThreadId()` | Removed — restructure logic accordingly |
 
-In the `flag=1` branch, the third chunk was not the hardcoded fallback string but the return value of `0x1405186C0`, which my Frida hook showed as a 40-character ASCII hex string. Importantly, the hasher received that value as literal text, not decoded binary.
+These will manifest as `TypeError: not a function` or `invalid match pattern` and are easy to misdiagnose as a targeting problem.
 
-## Reconstructing the hash inputs
+---
 
-After instrumenting the helper function, the hash side was no longer a mystery. The final SHA3-256 value could be reconstructed directly from the concatenated strings in the same order the runtime trace showed them.
+## What Changed Since erri120's Writeup
 
-For example, in the `flag=0` branch, the final digest is:
+erri120's 2023 writeup documented the following formula for all files:
 
 ```text
-SHA3-256("allUsersGenericId" + "IS" + "l)%ge7fomILhfj*Qfi+,")
+IV  = SHA3-256("allUsersGenericId" || filename)
+Key = SHA3-256("allUsersGenericId" || filename || machine_hash)
 ```
 
-This was an important correction to my earlier thinking. EA didn't use a hardware hash in every file decipher, but used a hardcoded string in a specific flag, for specific files, in a homemade SHA3 hasher function.
+This is **no longer accurate for all files**. EA made two deliberate changes:
 
-## Following the data into AES
+1. **Partial decoupling from hardware binding:** IS and CATS2 now use a hardcoded* string as the `extra` chunk instead of the machine hash. This means those two files can be decrypted without knowing the machine hash — but only if you can recover the hardcoded string from the binary.
 
-Once I had the recovered 32-byte SHA3 output, the next question was whether that material was actually being used as an AES key. 
+2. **New user-scoped files:** NS and the Nucleus-folder variant of CONF-production were not documented in the original writeup. These use the Nucleus ID as a prefix, binding them to a specific EA account rather than just the machine.
 
-A 32-byte value is compatible with AES-256, but compatibility alone proves nothing. I had to confirm they were still using AES-256, AES-256-CBC specifically.
+Both changes appear targeted at breaking third-party implementations that relied on the original formula.
 
-The key we've found could either be an IV, or a key. If we remember Erri's previous findings, they've found the IV was a constant (yes, nothing changes, only the key used to), and the key was the IV + something else, which was pieces of hardware information (taken from WMI), hashed into SHA1.
+---
 
-## Has it moved since ?
+## Key Derivation: Complete Reference
 
-Well, let me tell you it has changed. Not much, but enough that from the first writeup to today, it could break a few things. For certain files (IQ, IS, CATS2), it is **STILL** a constant, being :
+| File | Folder | IV | Key |
+|------|--------|----|-----|
+| IS | allUsers | `SHA3-256("allUsersGenericId" \|\| "IS")` | `SHA3-256("allUsersGenericId" \|\| "IS" \|\| hardcoded_str)` |
+| CATS2 | allUsers | `SHA3-256("allUsersGenericId" \|\| "CATS2")` | `SHA3-256("allUsersGenericId" \|\| "CATS2" \|\| hardcoded_str)` |
+| IQ | allUsers | `SHA3-256("allUsersGenericId" \|\| "IQ")` | `SHA3-256("allUsersGenericId" \|\| "IQ" \|\| machine_hash)` |
+| CONF-production | allUsers | `SHA3-256("CONF-production")` | `SHA3-256("CONF-production" \|\| machine_hash)` |
+| NS | Nucleus | `SHA3-256(nucleus_id \|\| "NS")` | `SHA3-256(nucleus_id \|\| "NS" \|\| machine_hash)` |
+| CONF-production | Nucleus | `SHA3-256(nucleus_id \|\| "CONF-production")` | `SHA3-256(nucleus_id \|\| "CONF-production" \|\| machine_hash)` |
 
-```text
-SHA3-256("allUsersGenericId" + file name)
-```
+Note that CONF-production in the allUsers folder uses **no prefix** for its IV and Key — just the filename itself, unlike every other file in that folder.
 
-BUT, in certain different files, it is quite a bit different. See, if you check `C:\ProgramData\EA Desktop\530c11479fe252fc5aabc24935b9776d4900eb3ba58fdc271e0d6229413ad40e` (yeah, remember that ?), we have 4 files. Which one is the file I haven't talked about ?
+---
 
-You've guessed it : CONF-production. This file is breaking the rules all by itself. But fear not, as it's simply a copy of [this globalConfig file from EA's servers](https://desktop-config.juno.ea.com/globalConfig.json). This one is... let's say it isn't common.
+## The Machine Hash
 
-It's available in there, and in another folder, which is another big string that also look like a SHA3-256 result... well, if you thought about that, congratulations, you've found another piece of the puzzle !
-
-Indeed, that other folder contains only 2 files: CONF-production (yet again ???) and NS. This will be extra important for the next steps, you'll find out why.
-
-The CONF-production file in the `530c11479fe252fc5aabc24935b9776d4900eb3ba58fdc271e0d6229413ad40e` folder... does not need any prefix (yes, you've heard me right). Which means, just write the file name. Yes, just the file name. __allUsersGen-__ no-no, just CONF-production. Test it, you'll see., but the key will need you to get your wonderful machine hash ! (yes, your SHA-1 hardware information.)
-
-Try to do this : 
-
-```text
-SHA3-256("CONF-production" + machinehash)
-```
-
-and you would get a key.
-
-## The machine hash extravaganza
-
-You don't know how the machine hash is made and you don't want to check again ? Check the EA Background Service logs, it blatantly shows it to you. Or recreate the string once again. It didn't change over time.
-
-For the recall, here's how we make the machine hash : 
+The machine hash is a **SHA1 digest** of a semicolon-delimited concatenation of WMI field values, in this order:
 
 ```
-Win32_BaseBoard Manufacturer
-Win32_BaseBoard SerialNumber
-Win32_BIOS Manufacturer
-Win32_BIOS SerialNumber
-Win32_VideoController PNPDeviceId
-Win32_Processor Manufacturer
-Win32_Processor ProcessorId
-Win32_Processor Name
+Win32_BaseBoard       → Manufacturer
+Win32_BaseBoard       → SerialNumber
+Win32_BIOS            → Manufacturer
+Win32_BIOS            → SerialNumber
+Win32_VideoController → PNPDeviceId
+Win32_Processor       → Manufacturer
+Win32_Processor       → ProcessorId
+Win32_Processor       → Name
 ```
 
-Some of the logs also seem to point that there's a few other things being checked on the spot (eg. why does it show my antivirus ?). There's a few other things being catched here, which are as followed : 
+Additionally, the **C:\ volume serial number** — the one returned by `GetVolumeInformationW`, not `Win32_PhysicalMedia.SerialNumber` — is included in the hardware string. These are the same components documented by erri120; this part has not changed.
 
+EA's Background Service logs emit this hash at startup — the fastest way to obtain it for validation is to read it directly from the logs rather than recomputing it.
+
+> **Note:** Additional fields (`Win32_OperatingSystem.SerialNumber`, `InstallDate`, antivirus product name) appear in the Background Service logs alongside the machine hash. These appear to feed a separate **pcSign** token used for new-device identification with EA's servers. How pcSign is fully constructed has not been traced end-to-end and is left for future work.
+
+---
+
+## The AES Layer
+
+EA Desktop uses **AES-256-CBC**. This is unchanged from erri120's original findings.
+
+The **IV** is the 32-byte intermediate SHA3-256 digest from the key derivation helper (the output of the first finalization), truncated to 16 bytes for CBC. The **Key** is the 32-byte final SHA3-256 digest (the output of the second finalization).
+
+Decryption in Python:
+
+```python
+from Crypto.Cipher import AES
+import hashlib, sha3
+
+def derive_iv_and_key(in1: bytes, in2: bytes, extra: bytes) -> tuple[bytes, bytes]:
+    iv  = hashlib.sha3_256(in1 + in2).digest()
+    key = hashlib.sha3_256(in1 + in2 + extra).digest()
+    return iv[:16], key
+
+# Example: IS file (flag=0, hardcoded string path)
+# Recover <hardcoded_str> from the binary for your EA App version
+iv, key = derive_iv_and_key(
+    b"allUsersGenericId",
+    b"IS",
+    b"<hardcoded_str>"
+)
+
+with open(r"C:\ProgramData\EA Desktop\530c11479fe252fc5aabc24935b9776d4900eb3ba58fdc271e0d6229413ad40e\IS", "rb") as f:
+    ciphertext = f.read()
+
+cipher    = AES.new(key, AES.MODE_CBC, iv)
+plaintext = cipher.decrypt(ciphertext)
+print(plaintext.decode("utf-8"))
 ```
-Win32_OperatingSystem SerialNumber
-Win32_OperatingSystem InstallDate
-AntivirusProduct Name
-```
 
-The operating system data is important for the pcSign creation, which will generate a one-time token in order for the EA services to identify which computer connects (also if it's a new computer).
+---
 
-Anyhow, that closed the loop on the discrepancies linked to this f- 
+## Why Both Analysis Methods Mattered
 
-## The other mystery
+**Static analysis (IDA + Class Informer)** gave the map: class names, vtable layouts, algorithm IDs, the `flag` parameter controlling which `extra` chunk is used, and the two-finalization structure of the key derivation helper. Without it, Frida hooks would, have had no meaningful targets.
 
-__WAIT ! You've talked about the other folder, that EXTRA IMPORTANT folder !__
+**Dynamic analysis (Frida 17.2)** gave the territory: the exact string inputs in the order they reached the hasher, which `flag` branch was taken for each file, and live confirmation that the SHA3 outputs fed directly into the AES key and IV slots. Without it, the static picture would have remained ambiguous — particularly for the Nucleus ID path, which would likely never have surfaced from static analysis alone.
 
-Ah yes, that folder. Well, you see, I was wondering how I could have a secondary folder that looked like our beloved one. And I dug... not much actually. Because my previous script actually gave me the answer.
+The combination is what made this tractable. Neither alone would have been sufficient.
 
-```
-[sub_14051AAD0]
-  in1 = <a number>
-  in2 = CONF-production
-  flag = 1
-[SHA3 upd #1]
-    chunk: len=13
-      hex : <that same number but in hexadecimal>
-      str : <that number>
-[SHA3 upd #2]
-    chunk: 
-      hex : 434f4e462d70726f64756374696f6e
-      str : CONF-production
-[SHA3 final #1]
-[SHA3 upd #3] 
-    chunk: len=40
-      hex : <machine hash in hexa>
-      str : <machine hash>
-[SHA3 final #2]
-```
+---
 
-That number... it looked very familiar. You see, when I had worked on my GOG Galaxy plugin, I had to use EA's very own API, from the Origin era. And one of the APIs was user-related (if you remember, it was [this URL](https://gateway.ea.com/proxy/identity/pids/me)). 
-And one of the pieces of information that it could give you is the Nucleus ID (which was the old Origin way of calling your account ID). You now understood what I'm saying here... that other piece of very important information is your Nucleus ID ! (little trick : hash your Nucleus ID in SHA3-256, you'll see the magic happen).
+## Final Notes
 
-Yes, it now uses the Nucleus ID as an alternative choice. Either you need to use a Nucleus ID (for all files in that folder), either it uses a hardcoded string. It will all depend on the flag.
+EA hasn't fundamentally redesigned their crypto since erri120's writeup. They wrapped standard SHA3 and AES in custom C++ classes, added a hardcoded string fallback for some files to partially decouple them from hardware binding, and introduced user-scoped files tied to the Nucleus ID. The core primitive — SHA3-256 into AES-256-CBC — is unchanged.
 
-So, if we recapitulate, we have :
-
-```text
-SHA3-256("allUsersGenericId" + file name + "l)%ge7fomILhfj*Qfi+,")
-```
-,
-```text
-SHA3-256("allUsersGenericId" + file name + machine hash)
-```
-,
-AND, for the specific CONF-production workaround,
-```text
-SHA3-256(Nucleus ID + file + machine hash)
-```
-in that nucleus ID folder, or 
-```text
-SHA3-256(file name + machine hash)
-```
-in that allUsers folder (yes, it can be very confusing).
-
-## Why the static and dynamic analysis both mattered
-
-Starting from the static analysis (via IDA) gave me a few pieces of very important information, to know where I should start digging further. The "Class Informer" tool gave me RTTI information about classes IDA wouldn't have named, and it simplified the searching task. From there, I could pinpoint which function called what, in which occasion it would have been called, and deduct which information was it filling out.
-
-The dynamic analysis (via Frida) gave me what the static analysis wouldn't have done : data on the go. The other piece of mystery, unfolding into my hands. By pinpointing what to trace and sniff, it improved our efficiency in finding out what we needed.
-
-## Final notes
-
-In the end, it was much less mysterious than it first appeared. Thanks to Erri's first writeup, we had an idea of what we needed to look for. This writeup confirms that some things haven't changed, and that some sneaky additions were made to cut off the previous decryption techniques. Once the SHA3 helper and the AES path were instrumented, the whole mechanism reduced to a predictable sequence of cat and mice.
-
-The useful lesson here was not just “EA hasn't changed anything”, they've did, but that they loved giving us a hard time by recoding some library functions to blur out obvious clues.
+The changes are modest but deliberate: targeted enough to break existing implementations without redesigning the system. The useful takeaway is the same as always — even a wrapper-heavy binary becomes predictable once you stop reading decompiled pseudocode and start logging concrete inputs, outputs, and call order at runtime.
